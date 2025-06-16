@@ -5,7 +5,7 @@ import random
 import time
 from enum import Enum
 from multiprocessing.managers import DictProxy, SyncManager
-
+from contextlib import contextmanager 
 
 GRID_SIZE = (40, 20)
 CHUNK_SIZE = (5, 5)
@@ -15,17 +15,27 @@ class Status(Enum):
     ALIVE = 0
     DEAD = 1
 
+@contextmanager
+def lock_com_timeout(lock, timeout=1.0, robot_id=None):
+    result = lock.acquire(timeout=timeout)
+    if not result and robot_id:
+        logging.warning(f"Robô {robot_id} falhou ao adquirir lock após {timeout} segundos - liberando recursos")
+        raise TimeoutError(f"Robô {robot_id} não conseguiu adquirir o lock")
+    try:
+        yield
+    finally:
+        if result:
+            lock.release()
 
 class Viewer(mp.Process):
     def __init__(self, shared_memory: DictProxy) -> None:
         clear_terminal()
         super().__init__()
-        
+
         self.shared_memory = shared_memory
-        
 
     def run(self) -> None:
-        while True:
+        while self.shared_memory["emergency_stop"].value == 0:
             if self.shared_memory["flags"]["init_done"]:
                 cols = []
 
@@ -58,33 +68,71 @@ class Robot(mp.Process):
         self.id = id
         self.shared_memory = shared_memory
         self.manager = manager
+        self.battery_mutex = manager.Lock()
 
     def run(self) -> None:
         if not self.shared_memory["flags"]["init_done"]:
             self.generate_grid(self.shared_memory, self.manager)  # type: ignore
-        logging.info(f"Robô {self.id} iniciou com os dados {self.shared_memory['robots'][int(self.id)]} e está rodando!")
-        
-        while True:
-            if self.shared_memory["robots"][int(self.id)]["status"] == Status.DEAD.value:
+        #Verifica se deve causar deadlock
+        if self.shared_memory["causar_deadlock"].value == 1: 
+            try: 
+                self.cria_deadlock()
+            except TimeoutError: 
+                self.shared_memory["emergency_stop"].value = 1
+                return 
+        logging.info(
+            f"Robô {self.id} iniciou com os dados {self.shared_memory['robots'][int(self.id)]} e está rodando!"
+        )
+        if self.shared_memory["causar_deadlock"].value == 2: 
+            try: 
+                self.cenario_deadlock()
+            except TimeoutError: 
+                self.shared_memory["emergency_stop"].value = 1
+                return 
+        logging.info(
+            f"Robô {self.id} iniciou com os dados {self.shared_memory['robots'][int(self.id)]} e está rodando!"
+        )
+        while self.shared_memory["emergency_stop"].value == 0:
+            if (
+                self.shared_memory["robots"][int(self.id)]["status"]
+                == Status.DEAD.value
+            ):
                 return  # Se o robô está morto, ele não faz mais nada
-            self.move_npc()
-            time.sleep(0.2)  
 
-   
+            if (
+                self.shared_memory["alive"] == 1
+                and self.shared_memory["robots"][int(self.id)]["status"]
+                == Status.ALIVE.value
+            ):
+                self.shared_memory["flags"]["vencedor"] = self.id
+                logging.info(f"Robô {self.id} venceu a batalha!")
+
+                return
+
+            self.move_npc()
+
     def tira_da_grid(self, id):
         robot = self.shared_memory["robots"][int(id)]
-        robot['status'] = Status.DEAD.value
-        i , j = robot['i'], robot['j']
-        GRID = self.shared_memory['grid']
+        robot["status"] = Status.DEAD.value
+        i, j = robot["i"], robot["j"]
+        GRID = self.shared_memory["grid"]
         GRID[i][j] = "-"
+        self.shared_memory["alive"] -= 1
         logging.info(f"Robô {id} da posição ({i}, {j}) foi removido da grid!")
         return
-    
+
     def move_npc(self):
-        with self.shared_memory["robots_mutex"], self.shared_memory["grid_mutex"]:
-            logging.info(f"Robô {self.id} adquiriu o robots_mutex e o grid_mutex!")
+        time.sleep(0.2 * self.shared_memory["robots"][int(self.id)]["V"])
+
+        with (
+            self.shared_memory["robots_mutex"],
+            self.shared_memory["grid_mutex"],
+        ):
+            logging.info(
+                f"Robô {self.id} adquiriu o robots_mutex e o grid_mutex!"
+            )
             robot = self.shared_memory["robots"][int(self.id)]
-            
+
             if robot["E"] <= 0:
                 logging.info(
                     f"Robô {robot['id']} não tem energia suficiente para se mover."
@@ -92,31 +140,30 @@ class Robot(mp.Process):
                 self.tira_da_grid(robot["id"])
                 return
 
-            if robot['status'] == Status.DEAD.value:
+            if robot["status"] == Status.DEAD.value:
                 logging.info(f"Robô {self.id} está morto e não pode se mover!")
                 return
 
-           
             # Busca o robo mais proximo
-            alvo = None 
+            alvo = None
             menor_dist = float("inf")
             for r in self.shared_memory["robots"]:
-                if str(r["id"]) == str(robot["id"]) or r["status"] == Status.DEAD.value:
+                if (
+                    str(r["id"]) == str(robot["id"])
+                    or r["status"] == Status.DEAD.value
+                ):
                     continue
                 dist = abs(r["i"] - robot["i"]) + abs(r["j"] - robot["j"])
                 if dist < menor_dist:
                     menor_dist = dist
-                    alvo = {
-                            "i": r["i"],
-                            "j": r["j"],
-                            "id": r["id"]
-                        }
-        
-            
+                    alvo = {"i": r["i"], "j": r["j"], "id": r["id"]}
+
             moved = False
 
             if not alvo:
-                logging.info(f"Robô {self.id} não encontrou nenhum alvo ativo.")
+                logging.info(
+                    f"Robô {self.id} não encontrou nenhum alvo ativo."
+                )
                 return
 
             # Calcular direção até o alvo
@@ -139,8 +186,8 @@ class Robot(mp.Process):
                     alternativas.append(d)
 
             # Combina: tenta primeiro as preferenciais, depois alternativas
-            direcoes = preferenciais + alternativas            
-            
+            direcoes = preferenciais + alternativas
+
             for di, dj in direcoes:
                 new_i = robot["i"] + di
                 new_j = robot["j"] + dj
@@ -148,7 +195,7 @@ class Robot(mp.Process):
                     logging.info(
                         f"Robô {robot['id']} não pode voltar para a posição anterior ({robot['ult_pos']})!"
                     )
-                    continue #não deixa voltar para posição anterior
+                    continue  # não deixa voltar para posição anterior
                 if 0 <= new_i < GRID_SIZE[1] and 0 <= new_j < GRID_SIZE[0]:
                     tmp_i, tmp_j = robot["i"], robot["j"]
                     robot["ult_pos"] = (tmp_i, tmp_j)  # Atualiza a ult_pos
@@ -174,14 +221,18 @@ class Robot(mp.Process):
                             f"Robô {robot['id']} se moveu para ({robot['i']}, {robot['j']}) e encontrou uma célula de recarga!"
                         )
                         self.pega_energia()
-                        logging.info(f"Robô {robot['id']} liberou robots_mutex e o grid_mutex!")
+                        logging.info(
+                            f"Robô {robot['id']} liberou robots_mutex e o grid_mutex!"
+                        )
                         return
                     else:
                         logging.info(
                             f"Robô {robot['id']}  se moveu para ({new_i}, {new_j}) está com {robot['E']} de energia"
                         )
                         self.esta_proximo()
-                        logging.info(f"Robo {robot['id']} liberou o robots_mutex e o grid mutex!")
+                        logging.info(
+                            f"Robo {robot['id']} liberou o robots_mutex e o grid mutex!"
+                        )
                     moved = True
                     break
 
@@ -190,14 +241,10 @@ class Robot(mp.Process):
                     f"Robô {self.id} não conseguiu se mover em nenhuma direção! e liberou o robots_mutex e o grid_mutex!"
                 )
 
-        
-
-       
-     
-       
-   
     def esta_proximo(self):
-        logging.info(f"Robô {self.id} está verificando se está próximo de outro robô.")
+        logging.info(
+            f"Robô {self.id} está verificando se está próximo de outro robô."
+        )
         robot = self.shared_memory["robots"][int(self.id)]
         i, j = robot["i"], robot["j"]
         # Verifica se o robô atual está em uma zona segura
@@ -207,7 +254,7 @@ class Robot(mp.Process):
             logging.info(
                 f"Robô {self.id} está em uma célula de recarga e não pode atacar."
             )
-            return 
+            return
 
         linha_de_combate = [
             (i - 1, j),  # Cima W
@@ -220,125 +267,168 @@ class Robot(mp.Process):
                 0 <= vi < GRID_SIZE[1] and 0 <= vj < GRID_SIZE[0]
             ):  # Verifica se a linha de combate tá na grid
                 cell = self.shared_memory["grid"][vi][vj]
-                if isinstance(cell, str) and cell not in ["-", "#","*"]:  
+                if isinstance(cell, str) and cell not in ["-", "#", "*"]:
                     robo_adversario = None
                     for r in self.shared_memory["robots"]:  # Busca o robo
-                        if r["id"] == cell:  
+                        if r["id"] == cell:
                             robo_adversario = r
                             break
                     if robo_adversario:
-                        cell_ad = self.shared_memory["grid"][robo_adversario["i"]][robo_adversario["j"]]
+                        cell_ad = self.shared_memory["grid"][
+                            robo_adversario["i"]
+                        ][robo_adversario["j"]]
                         if cell_ad == "*":
                             logging.info(
                                 f"Robô {cell_ad} está recarregando e não pode ser atacado."
                             )
-                            continue 
+                            continue
                         else:
                             # Se o robô adversário não está em uma célula de recarga ele pode ser atacado
                             logging.info(
                                 f"Robô {self.id} encontrou o robô {cell_ad} próximo e irá ataca-lo!"
                             )
-                            self.briga(
-                                int(self.id), int(cell_ad)
-                            )
+                            self.briga(int(self.id), int(cell_ad))
                             return
-            
+
         logging.info(
             f"Robô {self.id} não encontrou nenhum robô próximo para atacar."
         )
-        return  # Se não encontrou nenhum robô próximo, continua a busca 
-        
-    def briga(self, id1: int, id2: int):
-            robots = self.shared_memory["robots"]
-            logging.info(f"Robô {self.id} está brigando com o robô {id2}!")
-            Poder1 = (robots[id1]["F"] * 2) + robots[id1]["E"]
-            Poder2 = (robots[id2]["F"] * 2) + robots[id2]["E"]
+        return  # Se não encontrou nenhum robô próximo, continua a busca
 
-            if Poder1 > Poder2:
-                logging.info(f"Robô {self.id} venceu o Robô {id2}!")
-                self.tira_da_grid(id2)
-                return
-            elif Poder1 < Poder2:
-                logging.info(f"Robô {self.id} foi derrotado pelo Robô {id2}!")
-                self.tira_da_grid(id1)
-                return
-            else:
-                logging.info(
-                    f"Robô {self.id} e Robô {id2} empataram e ambos foram mortos"
-                )
-                self.tira_da_grid(id1)
-                self.tira_da_grid(id2)
-                return
-               
+    def briga(self, id1: int, id2: int):
+        robots = self.shared_memory["robots"]
+        logging.info(f"Robô {self.id} está brigando com o robô {id2}!")
+        Poder1 = (robots[id1]["F"] * 2) + robots[id1]["E"]
+        Poder2 = (robots[id2]["F"] * 2) + robots[id2]["E"]
+
+        if Poder1 > Poder2:
+            logging.info(f"Robô {self.id} venceu o Robô {id2}!")
+            self.tira_da_grid(id2)
+            return
+        elif Poder1 < Poder2:
+            logging.info(f"Robô {self.id} foi derrotado pelo Robô {id2}!")
+            self.tira_da_grid(id1)
+            return
+        else:
+            logging.info(
+                f"Robô {self.id} e Robô {id2} empataram e ambos foram mortos"
+            )
+            self.tira_da_grid(id1)
+            self.tira_da_grid(id2)
+            return
 
     def pega_energia(self) -> None:
         robot = self.shared_memory["robots"][int(self.id)]
         if robot["E"] == 100:
-                    logging.info(
-                        f"Robô {self.id} já está com energia máxima!"
-                    )
-                    return
-        robot["E"] = min(robot['E'] + 20, 100)
+            logging.info(f"Robô {self.id} já está com energia máxima!")
+            return
+        robot["E"] = min(robot["E"] + 20, 100)
         logging.info(
-                f"Robô {self.id} recarregou energia! Energia atual: {robot['E']}"
-                    )
+            f"Robô {self.id} recarregou energia! Energia atual: {robot['E']}"
+        )
+
     def generate_grid(
         self, shared_memory: DictProxy, manager: SyncManager
     ) -> None:
         with shared_memory["grid_mutex"]:
             if not shared_memory["flags"]["init_done"]:
-                
-                    logging.info(f"Robô {self.id} adquiriu o grid_mutex!")
+                logging.info(f"Robô {self.id} adquiriu o grid_mutex!")
 
-                    
-                    logging.info(f"Robô {self.id} está gerando o grid!")
+                logging.info(f"Robô {self.id} está gerando o grid!")
 
-                    shared_memory["grid"] = manager.list(
+                shared_memory["grid"] = manager.list(
+                    [
+                        manager.list(["-" for _ in range(GRID_SIZE[0])])
+                        for _ in range(GRID_SIZE[1])
+                    ]
+                )
+
+                shared_memory["quadrants"] = manager.list(
+                    [
                         [
-                            manager.list(["-" for _ in range(GRID_SIZE[0])])
-                            for _ in range(GRID_SIZE[1])
+                            (i, j)
+                            for i in range(m, m + CHUNK_SIZE[0])
+                            for j in range(n, n + CHUNK_SIZE[1])
                         ]
-                    )
+                        for m in range(0, GRID_SIZE[1], CHUNK_SIZE[0])
+                        for n in range(0, GRID_SIZE[0], CHUNK_SIZE[1])
+                    ]
+                )
 
-                    shared_memory["quadrants"] = manager.list(
-                        [
-                            [
-                                (i, j)
-                                for i in range(m, m + CHUNK_SIZE[0])
-                                for j in range(n, n + CHUNK_SIZE[1])
-                            ]
-                            for m in range(0, GRID_SIZE[1], CHUNK_SIZE[0])
-                            for n in range(0, GRID_SIZE[0], CHUNK_SIZE[1])
-                        ]
-                    )
+                for quadrant in shared_memory["quadrants"]:
+                    random.shuffle(quadrant)
 
-                    for quadrant in shared_memory["quadrants"]:
-                        random.shuffle(quadrant)
+                    for _ in range(int(random.uniform(-0.25, 0.75) + 1)):
+                        i, j = quadrant.pop()
+                        shared_memory["grid"][i][j] = "*"
 
-                        for _ in range(int(random.uniform(-0.5, 0.5) + 1)):
-                            i, j = quadrant.pop()
-                            shared_memory["grid"][i][j] = "*"
+                    for _ in range(int(random.uniform(2.5, 7.5))):
+                        i, j = quadrant.pop()
+                        shared_memory["grid"][i][j] = "#"
 
-                        for _ in range(int(random.uniform(2.5, 7.5))):
-                            i, j = quadrant.pop()
-                            shared_memory["grid"][i][j] = "#"  
+                for robot in shared_memory["robots"]:
+                    Q = [i for i in range(len(shared_memory["quadrants"]))]
 
-                    for robot in shared_memory["robots"]:
-                        Q = [i for i in range(len(shared_memory["quadrants"]))]
+                    random.shuffle(Q)
+                    q = Q.pop()
 
-                        random.shuffle(Q)
-                        q = Q.pop()
+                    i, j = random.choice(shared_memory["quadrants"][q])
+                    robot["i"] = i
+                    robot["j"] = j
+                    shared_memory["grid"][i][j] = robot["id"]  # //////
 
-                        i, j = random.choice(shared_memory["quadrants"][q])
-                        robot["i"] = i
-                        robot["j"] = j
-                        shared_memory["grid"][i][j] = robot["id"]  # //////
-
-                    shared_memory["flags"]["init_done"] = True
+                shared_memory["flags"]["init_done"] = True
 
             logging.info(f"Robô {self.id} liberou o grid_mutex!")
 
- 
+    def cenario_deadlock(self):
+        """Cenário de deadlock com prevenção usando lock_com_timeout"""
+        robot_id = int(self.id)
+        logging.info(f"Robô {robot_id} iniciando sequência que pode causar deadlock")
+        
+        if robot_id == 1:
+            try:
+                with lock_com_timeout(self.battery_mutex, timeout=2, robot_id=robot_id):
+                    logging.info(f"Robô {robot_id} adquiriu battery_mutex")
+                    time.sleep(1)
+                    
+                    with lock_com_timeout(self.shared_memory["grid_mutex"], timeout=1, robot_id=robot_id):
+                        logging.info(f"Robô {robot_id} adquiriu grid_mutex (DEADLOCK EVITADO)")
+                        time.sleep(0.5)
+            except TimeoutError:
+                logging.warning(f"Robô {robot_id} detectou possível deadlock, abortando operação")
+                return
+                
+        elif robot_id == 2:
+            try:
+                with lock_com_timeout(self.shared_memory["grid_mutex"], timeout=2, robot_id=robot_id):
+                    logging.info(f"Robô {robot_id} adquiriu grid_mutex")
+                    time.sleep(1)
+                    
+                    with lock_com_timeout(self.battery_mutex, timeout=1, robot_id=robot_id):
+                        logging.info(f"Robô {robot_id} adquiriu battery_mutex (DEADLOCK EVITADO)")
+                        time.sleep(0.5)
+            except TimeoutError:
+                logging.warning(f"Robô {robot_id} detectou possível deadlock, abortando operação")
+                return
+
+    def cria_deadlock(self):
+        """Método que realmente cria o deadlock (para demonstração)"""
+        robot_id = int(self.id)
+        if robot_id == 1:
+            self.battery_mutex.acquire()
+            logging.info(f"Robô {robot_id} adquiriu battery_mutex (DEADLOCK)")
+            time.sleep(2)
+            self.shared_memory["grid_mutex"].acquire()
+            logging.info(f"Robô {robot_id} adquiriu grid_mutex (NUNCA SERÁ EXECUTADO)")
+            
+        elif robot_id == 2:
+            self.shared_memory["grid_mutex"].acquire()
+            logging.info(f"Robô {robot_id} adquiriu grid_mutex (DEADLOCK)")
+            time.sleep(2)
+            self.battery_mutex.acquire()
+            logging.info(f"Robô {robot_id} adquiriu battery_mutex (NUNCA SERÁ EXECUTADO)")
+
 
 def clear_terminal():
     """Limpa o terminal."""
@@ -356,19 +446,21 @@ def main() -> None:
         level=logging.INFO,
     )
 
-  
+    deadlock = int(input("Causar deadlock?\n0-Não\n1-Sim(sem timeout)\n2-Sim(com timeout)\n "))
+
     with SyncManager() as manager:
-   
         shared_memory = manager.dict(
             grid=manager.list(),
             robots=None,  # será preenchido depois
             grid_mutex=manager.Lock(),
             robots_mutex=manager.Lock(),
             flags=manager.dict({"init_done": False, "vencedor": None}),
-            
+            alive=4,
+            causar_deadlock=manager.Value('i', deadlock),
+            emergency_stop=manager.Value('i', 0),
         )
 
-        #Cria a lista de dicionários de robo
+        # Cria a lista de dicionários de robo
         robot_dicts = [
             manager.dict(
                 {
@@ -379,27 +471,33 @@ def main() -> None:
                     "i": 0,
                     "j": 0,
                     "status": Status.ALIVE.value,
-                    "ult_pos": None 
+                    "ult_pos": None,
                 }
             )
-            for id in range(4) 
+            for id in range(4)
         ]
         shared_memory["robots"] = manager.list(robot_dicts)
 
-        #Recebe o shared_memory e cria cada robo com ele pronto
+        # Recebe o shared_memory e cria cada robo com ele pronto
         robots = [Robot(str(id), shared_memory, manager) for id in range(4)]
 
         viewer = Viewer(shared_memory)
         for robot in robots:
             robot.start()
         viewer.start()
-
+        
+        while True:
+            if shared_memory["emergency_stop"].value == 1:
+                for robot in robots:
+                    robot.terminate()  # Força a parada
+                viewer.terminate()
+                break
+            time.sleep(0.1)
+        
         for robot in robots:
             robot.join()
         viewer.join()
 
-        
-     
 
 if __name__ == "__main__":
     main()
